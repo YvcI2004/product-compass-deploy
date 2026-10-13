@@ -28,6 +28,7 @@ from pathlib import Path
 from flask import Flask, jsonify, request, send_from_directory
 
 import analyzer
+import extract as page_extract
 import profit
 import radar
 from data import PRODUCTS as STATIC_PRODUCTS, INITIAL_ACTIVITIES, TAG_GROUPS, WORKSPACE, CURRENT_USER
@@ -208,6 +209,25 @@ def delete_analysis(analysis_id):
         return bad(404, f"找不到分析记录 {analysis_id}")
     save_analyses(remaining)
     return jsonify({"deleted": analysis_id, "count": len(remaining)})
+
+
+@app.route("/api/extract", methods=["POST"])
+def extract_from_paste():
+    """
+    整页粘贴提取（v7.3 智能分析第一步）：商品页 Ctrl+A→Ctrl+C 的纯文本进来，
+    提取 ASIN/标题/6 个数字出去。人在看页面，机器只管抄数——不做任何网络请求。
+
+    隐私：粘贴文本可能含收货地址等个人信息——本接口不落盘、不打日志，只透传结果。
+    """
+    payload = get_body()
+    if payload is None:
+        return bad(400, "请求体必须是 JSON")
+    text = str(payload.get("text") or "")
+    if len(text.strip()) < 100:
+        return bad(400, "粘贴的内容太少了——请在 Amazon 页面上 Ctrl+A 全选、Ctrl+C 复制后再粘进来")
+    if len(text) > page_extract.MAX_TEXT:
+        return bad(400, f"粘贴的内容超过 {page_extract.MAX_TEXT // 1000}k 字符上限，请只复制商品页范围")
+    return jsonify(page_extract.extract(text))
 
 
 # ============================================================

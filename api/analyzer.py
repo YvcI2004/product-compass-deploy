@@ -80,6 +80,182 @@ RISK_TEXT = (
     "立项或下单前建议复核价格历史与销量曲线。"
 )
 
+# ============================================================
+# v7.3 智能分析：缺数推补 · 置信度 · 风险旗标 · 行动建议
+# ============================================================
+
+# 保险丝：一键关掉整套推补逻辑，回到「五项全填才给算」的老行为
+INFER_ENABLED = True
+
+# 推补默认值——刻意选「中性档」，不给推补品白送分数：
+#   rating 4.4 + reviews 150 → painpoint 落 0.35 中性分支（不是 1.0 满分）
+#   price 12.99 → 价格维度 0.7 档（不是黄金带 1.0）
+#   results 20000 → 竞争维度 0.45 档（不是稀缺 1.0）
+#   days 7 → 活跃度 0.6 档（不是极活跃 1.0）
+# 客户问起就这么解释：缺的数按「不好不坏的中性市场」假设算，置信度会如实打折。
+INFER_DEFAULTS = {
+    "results": 20000,
+    "days": 7,
+    "rating": 4.4,
+    "reviews": 150,
+    "price": 12.99,
+}
+
+# 置信度扣分 = 所影响维度权重的约 40%（results→compete 25 分权、days/reviews→activity
+# 20 分权……），合计最多 -32，保证最低还剩 68（推补品不至于被贬成「低置信」）
+INFER_PENALTY = {"results": 10, "days": 8, "reviews": 6, "rating": 4, "price": 4}
+
+# 推补字段的中文标签（置信度提示和前端展示共用）
+INFER_LABELS = {
+    "results": "搜索结果数", "days": "最新评论距今天数", "rating": "评分",
+    "reviews": "评论总数", "price": "价格",
+}
+
+# 疑似大牌词（命中 → 挥「品牌撞车」旗标，提醒授权/侵权风险；
+# "lg " 带尾空格防止误中 bulgarian 之类的单词中段）
+BRAND_WORDS = [
+    "nike", "adidas", "puma", "under armour", "apple", "samsung", "sony", "lg ",
+    "philips", "lego", "disney", "marvel", "pokemon", "barbie", "huggies",
+    "pampers", "kleenex", "gatorade", "nestle", "coleman", "yeti",
+]
+
+# 季节性信号词（命中 → 挥「季节性」旗标，提醒备货节奏；
+# 用 "ski" 会误中 skirt，所以只收 skiing/snow/winter 这类整词）
+SEASONAL_WORDS = [
+    "christmas", "xmas", "halloween", "valentine", "easter", "thanksgiving",
+    "4th of july", "independence day", "back to school", "swim", "skiing",
+    "snow", "winter", "summer",
+]
+
+
+def infer_missing(values):
+    """
+    五个可推补字段（price/rating/reviews/results/days）的缺省推断。
+    入参 values：{key: 数字或 None}（days 在 reviews==0 时本来就可以是 None）。
+    返回 (有效值 dict, 推补键列表, 置信度 int, 提升建议 list)。
+
+    days 的特殊处理：
+      评论数为 0 → 不推补（走「无评论」分支，填了反而白扣置信度）；
+      评论数缺失或 >0 且 days 缺失 → 按中性档推补。
+    """
+    vals = dict(values)
+    inferred = []
+    penalty = 0
+    for key in ("price", "rating", "reviews", "results"):
+        if vals.get(key) is None:
+            vals[key] = INFER_DEFAULTS[key]
+            inferred.append(key)
+            penalty += INFER_PENALTY[key]
+
+    if vals.get("days") is None and vals["reviews"]:
+        vals["days"] = INFER_DEFAULTS["days"]
+        inferred.append("days")
+        penalty += INFER_PENALTY["days"]
+
+    confidence = max(40, 100 - penalty)
+    hints = []
+    for key in ("results", "days", "reviews", "rating", "price"):
+        if key in inferred:
+            up = min(100, confidence + INFER_PENALTY[key])
+            hints.append(f"补上「{INFER_LABELS[key]}」→ 置信度升至 {up}")
+    return vals, inferred, confidence, hints
+
+
+def confidence_level(score):
+    """数值 → 文字档（不用 A/B/C 字母，避免和机会等级 A类/B类 撞车）。"""
+    if score >= 90:
+        return "高"
+    if score >= 75:
+        return "中高"
+    if score >= 60:
+        return "中"
+    return "低"
+
+
+def build_flags(inp, name, keyword):
+    """
+    风险旗标：从已有数据里再榨一层信号（不新增任何采集项）。
+    返回 [{key, level, text}]，level ∈ risk(红) / warn(琥珀) / info(蓝灰)。
+    """
+    flags = []
+    blob = f"{name} {keyword}".lower()
+
+    if inp["reviews"] >= 3000 and inp["rating"] >= 4.5:
+        flags.append({
+            "key": "review_moat", "level": "risk",
+            "text": f"评论护城河：{int(inp['reviews']):,} 条评论且评分 {inp['rating']:g}，"
+                    "新链接正面切入成本很高，优先考虑差异化改良",
+        })
+    hit = next((w for w in BRAND_WORDS if w in blob), None)
+    if hit:
+        flags.append({
+            "key": "brand_clash", "level": "warn",
+            "text": f"疑似大牌产品（匹配到「{hit.strip()}」）：先排查品牌授权与侵权风险，再决定是否推进",
+        })
+    if any(w in blob for w in SEASONAL_WORDS):
+        flags.append({
+            "key": "seasonal", "level": "warn",
+            "text": "季节性信号：需求集中在特定节日/季节，旺季前 2–3 个月备货，季末及时清库存",
+        })
+    if inp["price"] < 8:
+        flags.append({
+            "key": "price_low", "level": "warn",
+            "text": f"售价 ${inp['price']:g} 低于 $8：毛利空间非常薄，难以覆盖 FBA 与推广成本",
+        })
+    elif inp["price"] > 80:
+        flags.append({
+            "key": "price_high", "level": "warn",
+            "text": f"售价 ${inp['price']:g} 高于 $80：客单高，资金占用与售后门槛都高",
+        })
+    if inp["reviews"] == 0:
+        flags.append({
+            "key": "review_zero", "level": "info",
+            "text": "无评论链接：早期红利与验证风险并存——评论区验证不了需求，建议小批量试错",
+        })
+    return flags
+
+
+# 最弱两个维度的行动建议模板（key 与 dimensions 对齐）
+ADVICE_BY_DIM = {
+    "demand": "需求端偏弱：核对 BSR 是否大类排名，或换需求更旺的相邻类目词再测一轮。",
+    "compete": "竞争偏激烈：换更精准的长尾词重测搜索结果数，或找差异化卖点避开正面竞争。",
+    "activity": "活跃度不足：链接可能趋冷，对比同类目其他 ASIN 的评论节奏再下结论。",
+    "painpoint": "痛点信号弱：翻看 1–2 星差评区找具体抱怨，确认有可改进的切入点再动手。",
+    "price": "价格不在黄金带：用「利润测算」核算物流佣金后的真实毛利，或用组合装/升级材质提客单。",
+}
+ADVICE_BY_FLAG = {
+    "review_moat": "护城河深：考虑细分人群或配件/周边切入，别正面硬刚头部链接。",
+    "brand_clash": "先完成品牌授权与合规排查（商标/专利），再投入样品成本。",
+    "seasonal": "倒推备货节奏：旺季前 2 个月下大货，季末前清库存回笼资金。",
+    "price_low": "低价品建议做组合装或多件优惠拉高客单，否则很难覆盖固定成本。",
+    "price_high": "高客单品建议控制首批数量，用空运补货降低库存风险。",
+    "review_zero": "无评论品建议首批小量测款，用 Vine 和早期评论人计划快速积累口碑。",
+}
+
+
+def build_advice(dimensions, flags, inferred, hints):
+    """
+    行动建议：推补提示置顶 → 最弱两维 → 旗标建议，去重封顶 3 条。
+    """
+    advice = []
+    if inferred:
+        keys = "、".join(INFER_LABELS[k] for k in inferred)
+        advice.append(f"本报告有 {len(inferred)} 项推补值（{keys}），结果仅供参考：{hints[0] if hints else '补齐后重测'}")
+    weakest = sorted(dimensions, key=lambda d: d["value"])[:2]
+    for d in weakest:
+        line = ADVICE_BY_DIM.get(d["key"])
+        if line:
+            advice.append(line)
+    for f in flags:
+        line = ADVICE_BY_FLAG.get(f["key"])
+        if line:
+            advice.append(line)
+    out = []
+    for a in advice:
+        if a not in out:
+            out.append(a)
+    return out[:3]
+
 
 # ============================================================
 # ASIN 解析：支持完整链接 / 裸 ASIN
@@ -219,12 +395,28 @@ def analyze(payload):
     if not keyword:
         raise AnalysisError("「搜索关键词」还没填")
 
-    price = _num(payload.get("price"), "价格", 0.5, 5000)
-    rating = _num(payload.get("rating"), "评分", 0, 5)
-    reviews = int(_num(payload.get("reviews"), "评论数", 0, 1000000))
-    bsr = int(_num(payload.get("bsr"), "大类 BSR 排名", 1, 10000000))
-    results = int(_num(payload.get("results"), "搜索结果数", 0, 100000000))
+    # 五个数改可选（v7.3）：没填的按中性档推补，置信度如实打折；
+    # 填了但非法（错别字等）依然报 400，不掩盖输入错误。
+    # 关掉 INFER_ENABLED 即回到老的「必填」行为。
+    req = not INFER_ENABLED
+    price = _num(payload.get("price"), "价格", 0.5, 5000, required=req)
+    rating = _num(payload.get("rating"), "评分", 0, 5, required=req)
+    reviews = _num(payload.get("reviews"), "评论数", 0, 1000000, required=req)
+    bsr = int(_num(payload.get("bsr"), "大类 BSR 排名", 1, 10000000))   # 需求是最大权重，BSR 不推补
+    results = _num(payload.get("results"), "搜索结果数", 0, 100000000, required=req)
     days = _num(payload.get("days"), "最新评论距今天数", 0, 3650, required=False)
+
+    if INFER_ENABLED:
+        vals, inferred, confidence, hints = infer_missing({
+            "price": price, "rating": rating, "reviews": reviews,
+            "results": results, "days": days,
+        })
+        price, rating, reviews, results, days = (
+            vals["price"], vals["rating"], vals["reviews"], vals["results"], vals["days"],
+        )
+    else:
+        inferred, confidence, hints = [], 100, []
+    reviews, results = int(reviews), int(results)
 
     # ---- 五个维度 ----
     d_val, sales_text, d_text = dim_demand(bsr)
@@ -232,6 +424,14 @@ def analyze(payload):
     a_val, a_label, a_text = dim_activity(days, reviews)
     p_val, p_text = dim_painpoint(rating, reviews)
     pr_val, pr_note, pr_text = dim_price(price)
+
+    # 维度文本挂上「（推补值）」标记，让报告的每个数字都可追溯
+    def mark(text, *keys):
+        return text + "（推补值）" if any(k in inferred for k in keys) else text
+
+    d_text, c_text = mark(d_text), mark(c_text, "results")
+    a_text = mark(a_text, "days", "reviews")
+    p_text, pr_text = mark(p_text, "rating", "reviews"), mark(pr_text, "price")
 
     score = max(0, min(100, round(
         SCORE_WEIGHTS["demand"] * d_val
@@ -258,12 +458,27 @@ def analyze(payload):
     demand_word = "需求真实存在" if d_val >= 0.1 else "需求偏弱，链接处在类目长尾"
     reason_lines = [
         f"需求端：BSR 大类第 {bsr:,} 名，预估月销 {sales_text}，{demand_word}。",
-        f"竞争端：核心词「{keyword}」搜索结果约 {results:,} 条，{c_label}。",
-        f"活跃度：最新评论 {int(days)} 天前，链接{a_label}。" if days is not None else "活跃度：暂无评论数据。",
+        f"竞争端：核心词「{keyword}」搜索结果约 {results:,} 条，{c_label}{mark('', 'results')}。",
+        (f"活跃度：最新评论 {int(days)} 天前，链接{a_label}{mark('', 'days')}。"
+         if days is not None else "活跃度：暂无评论数据。"),
         p_text + "。",
-        f"价格端：${price:g}，{pr_note}。",
-        f"综合结论：机会指数 {score}/100（{grade}）——{verdict}",
+        f"价格端：${price:g}，{pr_note}{mark('', 'price')}。",
+        f"综合结论：机会指数 {score}/100（{grade}，数据置信度 {confidence} · {confidence_level(confidence)}）——{verdict}",
     ]
+
+    dimensions = [
+        {"key": "demand",    "label": "需求规模",  "value": round(d_val, 2),  "text": d_text},
+        {"key": "compete",   "label": "竞争友好度", "value": round(c_val, 2), "text": c_text},
+        {"key": "activity",  "label": "市场活跃度", "value": round(a_val, 2), "text": a_text},
+        {"key": "painpoint", "label": "痛点机会",  "value": round(p_val, 2),  "text": p_text},
+        {"key": "price",     "label": "价格空间",  "value": round(pr_val, 2), "text": pr_text},
+    ]
+    input_values = {
+        "price": price, "rating": rating, "reviews": reviews,
+        "bsr": bsr, "results": results, "days": days,
+    }
+    flags = build_flags(input_values, name, keyword)
+    advice = build_advice(dimensions, flags, inferred, hints)
 
     return {
         "id": f"AN-{uuid.uuid4().hex[:8]}",
@@ -272,50 +487,91 @@ def analyze(payload):
         "name": name,
         "keyword": keyword,
         "source_url": str(payload.get("link") or "").strip(),
-        "input": {
-            "price": price, "rating": rating, "reviews": reviews,
-            "bsr": bsr, "results": results, "days": days,
-        },
+        "input": input_values,
         "score": score,
         "grade": grade,
         "grade_cls": grade_cls,
         "est_sales": sales_text,
         "est_sales_note": f"由 BSR #{bsr:,} 按行业经验曲线估算",
-        "dimensions": [
-            {"key": "demand",    "label": "需求规模",  "value": round(d_val, 2),  "text": d_text},
-            {"key": "compete",   "label": "竞争友好度", "value": round(c_val, 2), "text": c_text},
-            {"key": "activity",  "label": "市场活跃度", "value": round(a_val, 2), "text": a_text},
-            {"key": "painpoint", "label": "痛点机会",  "value": round(p_val, 2),  "text": p_text},
-            {"key": "price",     "label": "价格空间",  "value": round(pr_val, 2), "text": pr_text},
-        ],
+        "dimensions": dimensions,
         "reason_lines": reason_lines,
+        # ---- v7.3 智能分析字段（旧记录没有这些键，前端一律 r.flags||[] 兜底）----
+        "inferred": inferred,                    # 被推补的字段 key 列表
+        "confidence": confidence,                # 数据置信度 0-100
+        "confidence_level": confidence_level(confidence),
+        "confidence_hints": hints,               # 「补 X → 置信度升至 Y」提示
+        "flags": flags,                          # 风险旗标 [{key,level,text}]
+        "advice": advice,                        # 行动建议（≤3 条）
         "risk": RISK_TEXT,
     }
 
 
 # ============================================================
-# 自测：直接运行本文件，看两份对比示例报告
+# 自测：直接运行本文件，覆盖三种典型场景 + 断言推补逻辑
 # ============================================================
 if __name__ == "__main__":
     samples = [
-        ("优秀示例 · 大型犬高支撑宠物床",
+        ("场景 1 · 全量输入（优秀示例）",
          "https://www.amazon.com/Furhaven-Orthopedic/dp/B0TEST0001/ref=sr_1_1",
          dict(name="优秀示例 · 大型犬高支撑宠物床", keyword="dog bed for large dogs",
               price=39.99, rating=4.3, reviews=2310, bsr=1560, results=5000, days=1)),
-        ("冷门示例 · 不锈钢宠物碗",
+        ("场景 2 · 只填核心四项（其余全部推补）",
          "B0TEST0002",
-         dict(name="冷门示例 · 不锈钢宠物碗", keyword="stainless dog bowl",
-              price=6.99, rating=4.8, reviews=5000, bsr=80000, results=60000, days=45)),
+         dict(name="场景 2 · 不锈钢宠物碗（只填了名称/关键词/BSR）", keyword="stainless dog bowl",
+              bsr=80000)),
+        ("场景 3 · 只缺 days（有评论但没填最新评论日期）",
+         "B0TEST0003",
+         dict(name="场景 3 · 不锈钢宠物碗", keyword="stainless dog bowl",
+              price=6.99, rating=4.8, reviews=5000, bsr=80000, results=60000)),
+        ("场景 4 · 新链接无评论（reviews=0，days 不推补）",
+         "B0TEST0004",
+         dict(name="场景 4 · 全新圣诞宠物玩具", keyword="christmas dog toy",
+              price=19.99, rating=0, reviews=0, bsr=45000, results=8000)),
     ]
     for title, link, extra in samples:
         r = analyze({"link": link, **extra})
         print("=" * 60)
         print(f"{r['name']}   ASIN {r['asin']}   {r['collected_at']}")
         print(f"机会指数 {r['score']}/100  {r['grade']}   预估月销 {r['est_sales']}")
+        print(f"置信度 {r['confidence']} · {r['confidence_level']}   推补字段：{r['inferred'] or '无'}")
         for d in r["dimensions"]:
             bar = "█" * int(d["value"] * 10)
             print(f"  {d['label']}  {bar:<10} {int(d['value']*100):>3}  {d['text']}")
         for line in r["reason_lines"]:
             print(f"  · {line}")
+        if r["flags"]:
+            print("  旗标：")
+            for f in r["flags"]:
+                print(f"    [{f['level']}] {f['text']}")
+        if r["advice"]:
+            print("  建议：")
+            for a in r["advice"]:
+                print(f"    → {a}")
+
+    # ---- 推补逻辑断言 ----
+    r2 = analyze({"link": "B0TEST0002", "name": "场景 2", "keyword": "k", "bsr": 80000})
+    assert set(r2["inferred"]) == {"price", "rating", "reviews", "results", "days"}, r2["inferred"]
+    assert r2["confidence"] == 68 and r2["confidence_level"] == "中", r2["confidence"]
+    assert r2["input"]["price"] == 12.99 and r2["input"]["results"] == 20000   # 中性默认值
+    r3 = analyze({"link": "B0TEST0003", "name": "场景 3", "keyword": "k",
+                  "price": 6.99, "rating": 4.8, "reviews": 5000, "bsr": 80000, "results": 60000})
+    assert r3["inferred"] == ["days"] and r3["confidence"] == 92, (r3["inferred"], r3["confidence"])
+    r4 = analyze({"link": "B0TEST0004", "name": "场景 4 · 全新圣诞宠物玩具", "keyword": "christmas dog toy",
+                  "price": 19.99, "rating": 0, "reviews": 0, "bsr": 45000, "results": 8000})
+    assert "days" not in r4["inferred"], "评论数为 0 时不应推补 days"
+    assert any(f["key"] == "seasonal" for f in r4["flags"]), r4["flags"]
+    assert any(f["key"] == "review_zero" for f in r4["flags"]), r4["flags"]
+    # 填了但非法依然报错（不掩盖输入错误）
+    try:
+        analyze({"link": "B0TEST0009", "name": "x", "keyword": "k", "bsr": 100, "price": "abc"})
+        raise SystemExit("价格填 abc 应该报错却没报")
+    except AnalysisError as e:
+        print(f"非法输入正确拦截：{e}")
+    # BSR 缺失仍然必须报错（需求是最大权重维度，不推补）
+    try:
+        analyze({"link": "B0TEST0009", "name": "x", "keyword": "k"})
+        raise SystemExit("BSR 缺失应该报错却没报")
+    except AnalysisError as e:
+        print(f"BSR 缺失正确拦截：{e}")
     print("=" * 60)
     print("自测完成，没有报错。")
