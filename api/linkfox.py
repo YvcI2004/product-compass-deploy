@@ -88,7 +88,13 @@ def _post(path, payload):
         except Exception:
             raise LinkFoxError(f"LinkFoxAI 接口返回 HTTP {e.code}，请稍后重试")
     except (urllib.error.URLError, TimeoutError) as e:
-        raise LinkFoxError(f"连不上 LinkFoxAI（{e}）——检查网络后重试")
+        msg = str(e)
+        if "403" in msg and "Tunnel" in msg:
+            # PythonAnywhere 免费档只放行少数白名单域名，ai-api.linkfox.com 不在其中
+            raise LinkFoxError(
+                "云服务器（PythonAnywhere 免费档）不放行 LinkFoxAI 的域名——"
+                "AI 作图工坊请在本地版使用（启动选品罗盘.bat），云上其余功能不受影响")
+        raise LinkFoxError(f"连不上 LinkFoxAI（{msg}）——检查网络后重试")
     except json.JSONDecodeError:
         raise LinkFoxError("LinkFoxAI 返回了无法解析的内容，请稍后重试")
 
@@ -380,17 +386,21 @@ def text_info(task_id):
 
 # ---------------- 图片下载代理（前端「下载到本地」走这里） ----------------
 # 只放行 LinkFox 家的域名，防止本接口被当成任意 URL 下载器（SSRF）。
-_ALLOWED_HOSTS = (
-    "linkfox.com",                       # 及其所有子域
-    "linkfoxai-ailab.oss-cn-shenzhen.aliyuncs.com",
-)
+# 图床实测有 linkfoxai-ailab / linkfoxai-ailab-prod 两个桶，统一按前缀+OSS 后缀校验。
+
+
+def _host_allowed(host):
+    return bool(host) and (
+        host.endswith("linkfox.com")                                   # 官网及其子域
+        or (host.startswith("linkfox") and host.endswith(".aliyuncs.com"))  # LinkFox 的 OSS 桶
+    )
 
 
 def fetch_bytes(url):
     """安全下载结果图 → (字节流, 文件名)。非白名单域名直接拒绝。"""
     from urllib.parse import urlparse
     host = urlparse(str(url)).hostname or ""
-    if not host or not (host.endswith(_ALLOWED_HOSTS[0]) or host in _ALLOWED_HOSTS[1:]):
+    if not _host_allowed(host):
         raise LinkFoxError("只允许下载 LinkFoxAI 返回的结果图地址")
     req = urllib.request.Request(url, headers={"User-Agent": "product-compass/8.0"})
     try:
