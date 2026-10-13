@@ -29,6 +29,7 @@ from flask import Flask, jsonify, request, send_from_directory
 
 import analyzer
 import extract as page_extract
+import linkfox
 import profit
 import radar
 from data import PRODUCTS as STATIC_PRODUCTS, INITIAL_ACTIVITIES, TAG_GROUPS, WORKSPACE, CURRENT_USER
@@ -542,6 +543,204 @@ def delete_supplier(supplier_id):
         return bad(404, "找不到这条供应商记录")
     save_suppliers(remaining)
     return jsonify({"deleted": supplier_id, "count": len(remaining)})
+
+
+# ============================================================
+# v8 · AI 作图工坊（LinkFoxAI 算力：抠图/裂变/修图/换模特/AI 文案）
+# 前端只跟本组接口打交道，API Key 始终留在后端（linkfox.py）。
+# 任务记录存在 linkfox_tasks.json，最多 60 条，页面刷新后历史还在。
+# ============================================================
+TASKS_FILE = GENERATED_DIR / "linkfox_tasks.json"
+
+
+def get_lf_tasks():
+    if TASKS_FILE.exists():
+        try:
+            data = json.loads(TASKS_FILE.read_text(encoding="utf-8"))
+            return data if isinstance(data, list) else []
+        except Exception:
+            pass
+    return []
+
+
+def save_lf_tasks(items):
+    TASKS_FILE.write_text(
+        json.dumps(items[:60], ensure_ascii=False, indent=2), encoding="utf-8"
+    )
+
+
+def _lf_find(tasks, tid):
+    return next((t for t in tasks if t.get("task_id") == str(tid)), None)
+
+
+@app.route("/api/linkfox/plan", methods=["GET"])
+def lf_plan():
+    """算力余额 + 价目表（免费接口，页面每次进入都刷新一次）。"""
+    try:
+        return jsonify({"plan": linkfox.plan(), "kinds": linkfox.kinds_spec()})
+    except linkfox.LinkFoxError as e:
+        return bad(502, str(e))
+
+
+@app.route("/api/linkfox/upload", methods=["POST"])
+def lf_upload():
+    """本地图片 → LinkFox 公网地址（免费）。前端 FileReader 读出 base64 后发来。"""
+    payload = get_body()
+    if payload is None:
+        return bad(400, "请求体必须是 JSON")
+    try:
+        url = linkfox.upload_base64(payload.get("fileName"), payload.get("base64"))
+    except linkfox.LinkFoxError as e:
+        return bad(502, str(e))
+    return jsonify({"url": url})
+
+
+@app.route("/api/linkfox/task", methods=["POST"])
+def lf_create_task():
+    """提交作图任务：校验→提交→存档（含预估点数）。实际扣点以查询结果为准。"""
+    payload = get_body()
+    if payload is None:
+        return bad(400, "请求体必须是 JSON")
+    kind = str(payload.get("kind") or "")
+    spec = linkfox.KINDS.get(kind)
+    if not spec:
+        return bad(400, f"未知功能：{kind}")
+    try:
+        task_id = linkfox.create_task(kind, payload)
+    except linkfox.LinkFoxError as e:
+        return bad(502, str(e))
+
+    record = {
+        "task_id": task_id,                    # 平台任务号（字符串）
+        "kind": kind,
+        "kind_name": spec["name"],
+        "created_at": _now(),
+        "status": 1, "status_text": "排队中",
+        "estimate": linkfox.estimate(kind, payload),   # 预估点数（None=动态计费）
+        "count": None,                          # 实耗点数（成功后回填）
+        "images": [], "error": "",
+        "note": str(payload.get("note") or "")[:120],  # 用户给任务写的备注
+    }
+    tasks = get_lf_tasks()
+    tasks.insert(0, record)
+    save_lf_tasks(tasks)
+    return jsonify(record)
+
+
+@app.route("/api/linkfox/tasks", methods=["GET"])
+def lf_list_tasks():
+    """任务历史（最新在前）。"""
+    return jsonify({"count": len(get_lf_tasks()), "tasks": get_lf_tasks()})
+
+
+@app.route("/api/linkfox/task/<task_id>", methods=["POST"])
+def lf_poll_task(task_id):
+    """查询一次任务状态并更新存档（前端每 10 秒调一次直到成功/失败）。"""
+    tasks = get_lf_tasks()
+    record = _lf_find(tasks, task_id)
+    if not record:
+        return bad(404, "找不到这个任务——可能存档被清理了")
+    try:
+        info = linkfox.task_info(task_id)
+    except linkfox.LinkFoxError as e:
+        return bad(502, str(e))
+    record.update({
+        "status": info["status"],
+        "status_text": info["status_text"],
+        "count": info["count"],
+        "error": info["error"],
+        "images": info["images"],
+    })
+    save_lf_tasks(tasks)
+    return jsonify(record)
+
+
+@app.route("/api/linkfox/refresh", methods=["POST"])
+def lf_refresh_image():
+    """结果图地址 8 小时过期后，用图片编号换新地址。"""
+    payload = get_body()
+    if payload is None:
+        return bad(400, "请求体必须是 JSON")
+    try:
+        url = linkfox.refresh_image_url(payload.get("imageId"))
+    except linkfox.LinkFoxError as e:
+        return bad(502, str(e))
+    return jsonify({"url": url})
+
+
+@app.route("/api/linkfox/download", methods=["GET"])
+def lf_download():
+    """下载代理：白名单校验后把图片字节流回给浏览器（触发另存为）。"""
+    url = request.args.get("url", "")
+    try:
+        data, name = linkfox.fetch_bytes(url)
+    except linkfox.LinkFoxError as e:
+        return bad(502, str(e))
+    return app.response_class(
+        data, mimetype="application/octet-stream",
+        headers={"Content-Disposition": f'attachment; filename="{name}"'},
+    )
+
+
+# ---------------- AI 文案（报告页「AI 写话术」，按 token 计费最低 1 点） ----------------
+@app.route("/api/linkfox/text", methods=["POST"])
+def lf_text_create():
+    payload = get_body()
+    if payload is None:
+        return bad(400, "请求体必须是 JSON")
+    try:
+        tid = linkfox.text_create(
+            payload.get("prompt"), payload.get("imageUrls"), payload.get("model"))
+    except linkfox.LinkFoxError as e:
+        return bad(502, str(e))
+
+    record = {
+        "task_id": tid,
+        "kind": "text",
+        "kind_name": "AI 文案",
+        "created_at": _now(),
+        "status": 1, "status_text": "生成中",
+        "estimate": None, "count": None,
+        "content": "", "error": "",
+        "note": str(payload.get("note") or "报告话术")[:120],
+    }
+    tasks = get_lf_tasks()
+    tasks.insert(0, record)
+    save_lf_tasks(tasks)
+    return jsonify(record)
+
+
+@app.route("/api/linkfox/text/<task_id>", methods=["POST"])
+def lf_text_poll(task_id):
+    """查一次文案任务（前端每 3 秒一次，通常十几秒出结果）。"""
+    tasks = get_lf_tasks()
+    record = _lf_find(tasks, task_id)
+    if not record:
+        return bad(404, "找不到这个文案任务")
+    try:
+        info = linkfox.text_info(task_id)
+    except linkfox.LinkFoxError as e:
+        return bad(502, str(e))
+    record.update({
+        "status": info["status"],
+        "status_text": info["status_text"],
+        "count": info["count"],
+        "error": info["error"],
+        "content": info["content"],
+    })
+    save_lf_tasks(tasks)
+    return jsonify(record)
+
+
+@app.route("/api/linkfox/tasks/<task_id>", methods=["DELETE"])
+def lf_delete_task(task_id):
+    """清掉一条任务记录（只删存档，不影响平台侧）。"""
+    tasks = get_lf_tasks()
+    remaining = [t for t in tasks if t.get("task_id") != str(task_id)]
+    if len(remaining) == len(tasks):
+        return bad(404, "找不到这条任务记录")
+    save_lf_tasks(remaining)
+    return jsonify({"deleted": task_id, "count": len(remaining)})
 
 
 @app.route("/api/scan", methods=["POST"])
