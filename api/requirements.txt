@@ -1,0 +1,3 @@
+# v7.2 起后端用 Flask（PythonAnywhere 免费档只支持 WSGI）；
+# fastapi/uvicorn 已退役，历史版本在 git 提交记录里。
+flask>=3.0

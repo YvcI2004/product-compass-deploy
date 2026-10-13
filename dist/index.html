@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/logo.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#2563eb" />
+    <meta name="description" content="选品罗盘 · AI 商品机会洞察演示 — 汇聚多平台信号，让选品判断有据可依。" />
+    <title>选品罗盘 · AI 商品机会洞察</title>
+    <script type="module" crossorigin src="/assets/index-C1wqQpEB.js"></script>
+    <link rel="stylesheet" crossorigin href="/assets/index-hZKkdDib.css">
+  </head>
+  <body>
+    <!-- 顶部加载进度条：任何接口请求期间自动显示（JS 里接管 fetch 驱动） -->
+    <div id="top-progress"></div>
+    <!-- 应用主体：路由渲染到这里。首屏先显示启动页，JS 加载完首份数据后自动替换 -->
+    <div id="app">
+      <div class="boot-splash">
+        <div class="boot-mark">
+          <svg viewBox="0 0 48 48" width="26" height="26" fill="none" aria-hidden="true">
+            <path d="M24 12 L28 24 L20 24 Z" fill="#ffffff"/>
+            <path d="M24 36 L28 24 L20 24 Z" fill="#ffffff" fill-opacity=".55"/>
+            <circle cx="24" cy="24" r="15" stroke="#ffffff" stroke-opacity=".4" stroke-width="2.4"/>
+          </svg>
+        </div>
+        <div class="boot-name">选品罗盘</div>
+        <div class="boot-dots"><i></i><i></i><i></i></div>
+      </div>
+    </div>
+    <!-- 弹窗挂载点：放在 #app 外面，页面重渲染时弹窗不会被销毁 -->
+    <div id="modal-root"></div>
+    <!-- PDF 导出挂载点：平时隐藏，点「导出 PDF」时填入报告并触发浏览器打印 -->
+    <div id="print-area"></div>
+  </body>
+</html>
