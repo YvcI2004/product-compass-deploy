@@ -27,6 +27,7 @@ from pathlib import Path
 
 from flask import Flask, jsonify, request, send_from_directory
 
+import amz_mcp
 import analyzer
 import extract as page_extract
 import linkfox
@@ -190,6 +191,12 @@ def analyze_product():
         return bad(500, f"分析出错：{e}")
 
     analyses = get_analyses()
+    # v8.2 去重：同一 ASIN 重新分析 = 更新那条记录（沿用旧 id，保住立项看板的关联），
+    # 不再出现同一 ASIN 两条不同分数的历史（v8.1 用户反馈的排版问题根源）。
+    old = next((a for a in analyses if a.get("asin") == result.get("asin")), None)
+    if old:
+        result["id"] = old["id"]
+        analyses = [a for a in analyses if a["id"] != old["id"]]
     analyses.insert(0, result)
     save_analyses(analyses)
     return jsonify(result)
@@ -229,6 +236,35 @@ def extract_from_paste():
     if len(text) > page_extract.MAX_TEXT:
         return bad(400, f"粘贴的内容超过 {page_extract.MAX_TEXT // 1000}k 字符上限，请只复制商品页范围")
     return jsonify(page_extract.extract(text))
+
+
+# ============================================================
+# v8.2 · 联网查询自动填表（LinkFox「亚马逊选品」数据服务，amz_mcp.py）
+# 前端只跟本组接口打交道；计费调用全部由用户点「查询」按钮触发（前端有确认弹窗），
+# 本后端不落盘查询结果——数据以「核对采集清单」里用户认可的数字为准入库。
+# ============================================================
+@app.route("/api/amz/detail", methods=["POST"])
+def amz_detail():
+    """ASIN → 商品公开数据（标题/价格/评分/评论/BSR），宽容映射成表单字段。"""
+    payload = get_body()
+    if payload is None:
+        return bad(400, "请求体必须是 JSON")
+    try:
+        return jsonify(amz_mcp.product_detail(payload.get("asin")))
+    except amz_mcp.LinkFoxError as e:
+        return bad(502, str(e))
+
+
+@app.route("/api/amz/search", methods=["POST"])
+def amz_search():
+    """关键词 → 搜索结果数（填「搜索结果数」字段用）。"""
+    payload = get_body()
+    if payload is None:
+        return bad(400, "请求体必须是 JSON")
+    try:
+        return jsonify(amz_mcp.search(payload.get("keyword")))
+    except amz_mcp.LinkFoxError as e:
+        return bad(502, str(e))
 
 
 # ============================================================
