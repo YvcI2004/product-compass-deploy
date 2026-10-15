@@ -282,6 +282,94 @@ def tools_count():
     return len(result.get("tools") or [])
 
 
+# ---------------- v8.6 · 评论分析（按星级取样） ----------------
+TOOL_REVIEWS = "/amazon/reviews/list"      # 精品服务-商品评论（单 ASIN/次）
+
+
+def _iter_lists(obj, depth=0):
+    """深度优先枚举结构里所有 list（供找评论数组用）。"""
+    if depth > 7:
+        return
+    if isinstance(obj, list):
+        yield obj
+        for v in obj:
+            yield from _iter_lists(v, depth + 1)
+    elif isinstance(obj, dict):
+        for v in obj.values():
+            yield from _iter_lists(v, depth + 1)
+
+
+def _is_review_dict(d):
+    """像评论的 dict：有正文类字段，或（星级+标题）；排除表格列定义等元数据。"""
+    keys = {_norm_key(k) for k in d}
+    if keys & {"celltype", "sortable", "filterable", "field", "columntype"}:
+        return False                       # 表格列定义（真实返回里踩过：列也有 title）
+    has_content = bool(keys & {"content", "text", "reviewcontent", "comment",
+                               "body", "reviewtext"})
+    has_rating = bool(keys & {"rating", "star", "stars", "rate", "ratingvalue",
+                              "starnum", "ratingtext"})
+    return has_content or (has_rating and bool(keys & {"title", "reviewtitle"}))
+
+
+def _find_reviews(data):
+    """在任意结构里找「评论数组」：元素是 dict 且长得像评论，按命中密度选最优。
+    每条归一成 {rating:int, title, content, date}；rating 解析不出保 0。"""
+    best, best_score = [], 0
+    for lst in _iter_lists(data):
+        dicts = [x for x in lst if isinstance(x, dict)]
+        if len(dicts) < len(lst) * 0.6 or len(dicts) < 3:
+            continue
+        score = sum(1 for d in dicts[:50] if _is_review_dict(d))
+        if score > best_score:
+            best, best_score = dicts, score
+    if best_score < 3:
+        return []
+
+    def _field(d, names):
+        hit = _hunt(d, names)
+        if hit is None:
+            return ""
+        return str(hit[0]).strip()
+
+    out = []
+    for d in best:
+        rating = _to_float(_field(d, ["rating", "star", "stars", "rate",
+                                      "ratingvalue", "starnum"]))
+        if rating is None:   # 形如 "FIVE_STAR" / "5星" 的兜底
+            raw = _field(d, ["rating", "star", "ratingtext"]).lower()
+            for word, num in [("five", 5), ("four", 4), ("three", 3),
+                              ("two", 2), ("one", 1)]:
+                if word in raw:
+                    rating = float(num)
+                    break
+        out.append({
+            "rating": int(rating) if rating else 0,
+            "title": _field(d, ["title", "reviewtitle"])[:200],
+            "content": _field(d, ["content", "text", "reviewcontent", "comment",
+                                  "body", "reviewtext"])[:2000],
+            "date": _field(d, ["date", "reviewdate", "creattime", "createtime",
+                               "timestamp", "reviewtime"])[:40],
+        })
+    return out
+
+
+def reviews_list(asin, star_nums=None, sort_by="recent"):
+    """按星级取样商品评论（一次计费调用；由用户在页面上点按钮触发）。
+    star_nums: {1:n,…,5:n}——传了就只取这些星级；None = 服务默认每档 10 条。
+    返回 (items, preview)；items 为归一化评论列表。"""
+    asin = str(asin or "").strip().upper()
+    if not ASIN_RE.match(asin):
+        raise linkfox.LinkFoxError("ASIN 格式不对——需要 10 位字母数字（如 B0D9RPX853）")
+    args = {"asin": asin, "sortBy": sort_by}
+    for s in range(1, 6):
+        if star_nums and s in star_nums:
+            args[f"star{s}Num"] = max(0, min(100, int(star_nums[s])))
+    raw = _call_tool(TOOL_REVIEWS, args)
+    items = _find_reviews(raw)
+    preview = json.dumps(raw, ensure_ascii=False, indent=1)[:RAW_PREVIEW]
+    return items, preview
+
+
 LinkFoxError = linkfox.LinkFoxError   # 本模块与 linkfox 共用同一个异常类型
 
 

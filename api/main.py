@@ -268,6 +268,74 @@ def amz_search():
 
 
 # ============================================================
+# v8.6 · 评论分析（/amazon/reviews/list 按星级取样 → 本地词频分析）
+# 计费只发生在取评论一步（用户点击+确认）；分析本身本地零费用。
+# 落盘：仅存分析结果与摘录（≤180 字），原始评论全文不落盘。
+# ============================================================
+REVIEW_PLANS = {
+    "light":    {1: 10, 2: 10, 3: 10, 4: 10, 5: 10},     # 共 50 条
+    "standard": {1: 25, 2: 15, 3: 10, 4: 10, 5: 10},     # 共 70 条（差评加权）
+    "deep":     {1: 50, 2: 30, 3: 15, 4: 10, 5: 10},     # 共 115 条（痛点深挖）
+}
+REVIEW_REPORTS_FILE = GENERATED_DIR / "review_reports.json"
+
+
+def _review_reports():
+    if REVIEW_REPORTS_FILE.exists():
+        try:
+            return json.loads(REVIEW_REPORTS_FILE.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return []
+
+
+def _save_review_reports(rows):
+    REVIEW_REPORTS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    REVIEW_REPORTS_FILE.write_text(
+        json.dumps(rows[-30:], ensure_ascii=False, indent=1), encoding="utf-8")
+
+
+@app.route("/api/amz/reviews", methods=["POST"])
+def amz_reviews():
+    """ASIN → 按采样方案取评论 → 本地分析（痛点/卖点/机会），结果入历史。"""
+    import review_analyze
+    payload = get_body()
+    if payload is None:
+        return bad(400, "请求体必须是 JSON")
+    asin = str(payload.get("asin") or "").strip().upper()
+    if not amz_mcp.ASIN_RE.match(asin):
+        return bad(400, "ASIN 格式不对——需要 10 位字母数字（如 B0D9RPX853）")
+    plan = payload.get("plan") if payload.get("plan") in REVIEW_PLANS else "standard"
+    try:
+        items, preview = amz_mcp.reviews_list(asin, REVIEW_PLANS[plan])
+    except amz_mcp.LinkFoxError as e:
+        return bad(502, str(e))
+    if len(items) < 3:
+        return bad(502, "取到的评论太少（该商品可能评论量很低，或数据服务返回异常）——"
+                        "可换个 ASIN 或稍后再试")
+    result = review_analyze.analyze(items)
+    report = {
+        "id": uuid.uuid4().hex[:10],
+        "asin": asin,
+        "plan": plan,
+        "sampled": REVIEW_PLANS[plan],
+        "ts": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "raw_preview": preview[:800],
+        **result,
+    }
+    rows = _review_reports()
+    rows.append(report)
+    _save_review_reports(rows)
+    return jsonify(report)
+
+
+@app.route("/api/reviews/history", methods=["GET"])
+def reviews_history():
+    """评论分析历史（新→旧，给历史列表用）。"""
+    return jsonify({"reports": list(reversed(_review_reports()))})
+
+
+# ============================================================
 # 关键词雷达（真 demo 第二步：不定期采集 + 差值引擎）
 # ============================================================
 def get_radar():
