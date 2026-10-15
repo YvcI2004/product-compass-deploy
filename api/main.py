@@ -307,12 +307,14 @@ def amz_reviews():
         return bad(400, "ASIN 格式不对——需要 10 位字母数字（如 B0D9RPX853）")
     plan = payload.get("plan") if payload.get("plan") in REVIEW_PLANS else "standard"
     try:
-        items, preview = amz_mcp.reviews_list(asin, REVIEW_PLANS[plan])
+        items, preview, diag = amz_mcp.reviews_list(asin, REVIEW_PLANS[plan])
     except amz_mcp.LinkFoxError as e:
         return bad(502, str(e))
+    print(f"[reviews] asin={asin} plan={plan} {diag}", flush=True)  # 仅数字摘要，不含评论内容
     if len(items) < 3:
-        return bad(502, "取到的评论太少（该商品可能评论量很低，或数据服务返回异常）——"
-                        "可换个 ASIN 或稍后再试")
+        return bad(502, "数据服务两次取样都没取到评论"
+                        f"（{diag}）——常见原因：该商品评论量过低，或数据服务当天不稳定。"
+                        "可换一个评论较多的 ASIN，或稍后再试")
     result = review_analyze.analyze(items)
     report = {
         "id": uuid.uuid4().hex[:10],

@@ -353,21 +353,48 @@ def _find_reviews(data):
     return out
 
 
-def reviews_list(asin, star_nums=None, sort_by="recent"):
-    """按星级取样商品评论（一次计费调用；由用户在页面上点按钮触发）。
+def _reviews_call(args):
+    """单次评论调用：归一化 + 顺带提炼服务自己的 errcode/total（仅数字，供排查）。"""
+    raw = _call_tool(TOOL_REVIEWS, args)
+    items = _find_reviews(raw)
+    meta = {}
+    if isinstance(raw, dict):
+        for k in ("errcode", "total"):
+            try:
+                meta[k] = int(raw.get(k))
+            except (TypeError, ValueError):
+                pass
+    preview = json.dumps(raw, ensure_ascii=False, indent=1)[:RAW_PREVIEW]
+    return items, meta, preview
+
+
+def reviews_list(asin, star_nums=None, sort_by="recent", domain_code="com"):
+    """按星级取样商品评论（计费调用；由用户在页面上点按钮触发）。
     star_nums: {1:n,…,5:n}——传了就只取这些星级；None = 服务默认每档 10 条。
-    返回 (items, preview)；items 为归一化评论列表。"""
+
+    v8.7 教训：只传 asin+sortBy+星级时，平台多次「成功但 0 条」（errcode=200,
+    total=0）。schema 里还有 domainCode/mediaType/formatType/reviewerType 四个
+    有默认值的参数——全部显式传上规避。星级取样仍取到 0 条时，自动退回服务端
+    默认口径（完全不传星级=每档 10 条）再试一次，两次都空才算失败。
+    返回 (items, preview, diag)；diag 为各次尝试的数字摘要（写日志/报错用）。"""
     asin = str(asin or "").strip().upper()
     if not ASIN_RE.match(asin):
         raise linkfox.LinkFoxError("ASIN 格式不对——需要 10 位字母数字（如 B0D9RPX853）")
-    args = {"asin": asin, "sortBy": sort_by}
+    base = {"asin": asin, "sortBy": sort_by, "domainCode": domain_code,
+            "mediaType": "all_contents", "formatType": "all_formats",
+            "reviewerType": "all_reviews"}
+    args = dict(base)
     for s in range(1, 6):
         if star_nums and s in star_nums:
             args[f"star{s}Num"] = max(0, min(100, int(star_nums[s])))
-    raw = _call_tool(TOOL_REVIEWS, args)
-    items = _find_reviews(raw)
-    preview = json.dumps(raw, ensure_ascii=False, indent=1)[:RAW_PREVIEW]
-    return items, preview
+    items, meta, preview = _reviews_call(args)
+    diag = [f"星级取样 errcode={meta.get('errcode', '?')} total={meta.get('total', '?')} 取到{len(items)}条"]
+    if len(items) < 3:
+        items2, meta2, preview2 = _reviews_call(dict(base))
+        diag.append(f"默认取样 errcode={meta2.get('errcode', '?')} total={meta2.get('total', '?')} 取到{len(items2)}条")
+        if len(items2) > len(items):
+            return items2, preview2, "；".join(diag)
+    return items, preview, "；".join(diag)
 
 
 LinkFoxError = linkfox.LinkFoxError   # 本模块与 linkfox 共用同一个异常类型
